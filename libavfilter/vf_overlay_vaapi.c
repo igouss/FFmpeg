@@ -157,6 +157,17 @@ static int overlay_vaapi_build_filter_params(AVFilterContext *avctx)
     return 0;
 }
 
+static int overlay_vaapi_frame_is_rgb(const AVFrame *frame)
+{
+    const AVHWFramesContext *hwfc;
+    const AVPixFmtDescriptor *desc;
+
+    hwfc = (const AVHWFramesContext *)frame->hw_frames_ctx->data;
+    desc = av_pix_fmt_desc_get(hwfc->sw_format);
+
+    return desc && (desc->flags & AV_PIX_FMT_FLAG_RGB);
+}
+
 static int overlay_vaapi_blend(FFFrameSync *fs)
 {
     AVFilterContext    *avctx = fs->parent;
@@ -164,10 +175,11 @@ static int overlay_vaapi_blend(FFFrameSync *fs)
     OverlayVAAPIContext *ctx  = avctx->priv;
     VAAPIVPPContext *vpp_ctx  = avctx->priv;
     AVFrame *input_main, *input_overlay;
-    AVFrame *output;
+    AVFrame *output, *overlay = NULL;
     VAProcPipelineParameterBuffer params[2];
     VABlendState blend_state = { 0 }; /**< Blend State */
-    VARectangle overlay_region, overlay_input_region, output_region;
+    VARectangle overlay_region, overlay_input_region;
+    VARectangle main_input_region, output_region;
     int err;
 
     err = ff_framesync_get_frame(fs, 0, &input_main, 0);
@@ -199,6 +211,11 @@ static int overlay_vaapi_blend(FFFrameSync *fs)
     if (err < 0)
         goto fail;
 
+    /* The region set above lives in the context and is overwritten when
+     * the parameters of the overlay are initialised below. */
+    main_input_region = vpp_ctx->input_region;
+    params[0].surface_region = &main_input_region;
+
     output_region = (VARectangle) {
         .x      = 0,
         .y      = 0,
@@ -228,7 +245,29 @@ static int overlay_vaapi_blend(FFFrameSync *fs)
                    "will crop the overlay image according based on the main image.\n");
         }
 
-        memcpy(&params[1], &params[0], sizeof(params[0]));
+        /* The overlay is described by its own colour properties. Those it
+         * does not specify are assumed to be those of the main input; matrix
+         * and range only if both are RGB or both are YUV. */
+        overlay = av_frame_clone(input_overlay);
+        if (!overlay) {
+            err = AVERROR(ENOMEM);
+            goto fail;
+        }
+        if (overlay->color_primaries == AVCOL_PRI_UNSPECIFIED)
+            overlay->color_primaries = input_main->color_primaries;
+        if (overlay->color_trc == AVCOL_TRC_UNSPECIFIED)
+            overlay->color_trc = input_main->color_trc;
+        if (overlay_vaapi_frame_is_rgb(overlay) ==
+            overlay_vaapi_frame_is_rgb(input_main)) {
+            if (overlay->colorspace == AVCOL_SPC_UNSPECIFIED)
+                overlay->colorspace = input_main->colorspace;
+            if (overlay->color_range == AVCOL_RANGE_UNSPECIFIED)
+                overlay->color_range = input_main->color_range;
+        }
+
+        err = ff_vaapi_vpp_init_params(avctx, &params[1], overlay, output);
+        if (err < 0)
+            goto fail;
 
         blend_state.flags         = ctx->blend_flags;
         blend_state.global_alpha  = ctx->blend_alpha;
@@ -249,6 +288,7 @@ static int overlay_vaapi_blend(FFFrameSync *fs)
     }
 
     err = ff_vaapi_vpp_render_pictures(avctx, params, input_overlay ? 2 : 1, output);
+    av_frame_free(&overlay);
     if (err < 0)
         goto fail;
 
@@ -259,6 +299,7 @@ static int overlay_vaapi_blend(FFFrameSync *fs)
     return ff_filter_frame(outlink, output);
 
 fail:
+    av_frame_free(&overlay);
     av_frame_free(&output);
     return err;
 }
