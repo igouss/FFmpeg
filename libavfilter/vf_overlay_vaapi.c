@@ -167,7 +167,7 @@ static int overlay_vaapi_blend(FFFrameSync *fs)
     AVFrame *output;
     VAProcPipelineParameterBuffer params[2];
     VABlendState blend_state = { 0 }; /**< Blend State */
-    VARectangle overlay_region, output_region;
+    VARectangle overlay_region, overlay_input_region, output_region;
     int err;
 
     err = ff_framesync_get_frame(fs, 0, &input_main, 0);
@@ -234,8 +234,17 @@ static int overlay_vaapi_blend(FFFrameSync *fs)
         blend_state.global_alpha  = ctx->blend_alpha;
         params[1].blend_state = &blend_state;
 
+        overlay_input_region = (VARectangle) {
+            .x      = input_overlay->crop_left,
+            .y      = input_overlay->crop_top,
+            .width  = input_overlay->width -
+                     (input_overlay->crop_left + input_overlay->crop_right),
+            .height = input_overlay->height -
+                     (input_overlay->crop_top + input_overlay->crop_bottom),
+        };
+
         params[1].surface       = (VASurfaceID)(uintptr_t)input_overlay->data[3];
-        params[1].surface_region = NULL;
+        params[1].surface_region = &overlay_input_region;
         params[1].output_region = &overlay_region;
     }
 
